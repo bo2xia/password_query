@@ -1,0 +1,15 @@
+version: '3'
+services:
+  flask:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./instance:/app/instance
+    environment:
+      - FLASK_APP=app.py
+      - SECRET_KEY=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+      - LANG=C.UTF-8
+    container_name: password-query-container
