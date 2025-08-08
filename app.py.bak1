@@ -1,0 +1,566 @@
+import os
+import logging
+from datetime import datetime, timedelta
+from flask import Flask, request, render_template, redirect, url_for, session, flash, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, IntegerField, SelectField, SubmitField
+from wtforms.validators import DataRequired, Length, NumberRange, EqualTo, Regexp
+from werkzeug.security import generate_password_hash, check_password_hash
+import string
+import random
+import re
+from time import time
+
+# 配置日志，确保使用 UTF-8 编码
+logging.basicConfig(
+    filename='app.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    encoding='utf-8'
+)
+
+# Flask 应用配置
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key')  # 从环境变量获取密钥
+app.permanent_session_lifetime = timedelta(minutes=30)  # 会话有效期 30 分钟
+
+# 使用绝对路径配置数据库
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+INSTANCE_DIR = os.path.join(BASE_DIR, 'instance')
+DATABASE_PATH = os.path.join(INSTANCE_DIR, 'accounts.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DATABASE_PATH}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# 登录失败跟踪
+login_attempts = {}  # 存储用户登录尝试次数和时间
+
+# 表单定义
+class LoginForm(FlaskForm):
+    username = StringField('用户名', validators=[DataRequired(message='请输入用户名'), Length(min=3, max=20)])
+    password = PasswordField('密码', validators=[DataRequired(message='请输入密码')])
+    submit = SubmitField('登录')
+
+class ChangePasswordForm(FlaskForm):
+    current_password = PasswordField('当前密码', validators=[DataRequired(message='请输入当前密码')])
+    new_password = PasswordField('新密码', validators=[
+        DataRequired(message='请输入新密码'),
+        Length(min=8, message='密码长度至少为 8 位'),
+        Regexp(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[A-Za-z\d]{8,}$',
+               message='密码必须包含大小写字母和数字')
+    ])
+    confirm_password = PasswordField('确认新密码', validators=[
+        DataRequired(message='请再次输入新密码'),
+        EqualTo('new_password', message='两次输入的密码不一致')
+    ])
+    submit = SubmitField('修改密码')
+
+class BatchGenerateForm(FlaskForm):
+    username = SelectField('用户名', validators=[DataRequired(message='请选择用户名')], choices=[])
+    count = IntegerField('生成数量', validators=[DataRequired(message='请输入生成数量'), NumberRange(min=1, max=100)])
+    max_query_count = IntegerField('最大查询次数', validators=[DataRequired(message='请输入最大查询次数'), NumberRange(min=1, max=100)])
+    duration_hours = SelectField('使用时长', choices=[('720', '720小时'), ('24', '24小时')], validators=[DataRequired(message='请选择使用时长')])
+    submit = SubmitField('生成卡密')
+
+class AccountForm(FlaskForm):
+    username = StringField('用户名', validators=[DataRequired(message='请输入用户名'), Length(min=3, max=20)])
+    password = PasswordField('密码')
+    action = SelectField('操作', choices=[('add', '添加账号'), ('modify_random', '修改密码为随机')])
+    submit = SubmitField('提交')
+
+# 数据模型
+class Admin(db.Model):
+    __tablename__ = 'admins'
+    username = db.Column(db.String(20), primary_key=True)
+    password = db.Column(db.String(128), nullable=False)  # 哈希存储
+
+class Account(db.Model):
+    __tablename__ = 'accounts'
+    username = db.Column(db.String(20), primary_key=True)
+    password = db.Column(db.String(128), nullable=False)  # 明文存储
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Card(db.Model):
+    __tablename__ = 'cards'
+    card_key = db.Column(db.String(16), primary_key=True)
+    username = db.Column(db.String(20), db.ForeignKey('accounts.username'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    first_used_at = db.Column(db.DateTime)
+    query_count = db.Column(db.Integer, default=0)
+    max_query_count = db.Column(db.Integer, default=10)
+    duration_hours = db.Column(db.Integer, default=720)
+
+# 辅助函数
+def generate_random_string(length=8, exclude_chars='', chars=None):
+    chars = chars or (string.ascii_letters + string.digits)
+    chars = ''.join(c for c in chars if c not in exclude_chars)
+    return ''.join(random.choice(chars) for _ in range(length))
+
+def is_valid_username(username):
+    # 支持中文字符、字母、数字和下划线，长度 3-20
+    return bool(re.match(r'^[\w\u4e00-\u9fff]{3,20}$', username))
+
+def check_admin_credentials(username, password):
+    try:
+        if username in login_attempts:
+            attempts, lock_time = login_attempts[username]
+            if attempts >= 3 and time() < lock_time + 300:
+                logging.warning(f"用户 {username} 登录锁定，剩余 {300 - (time() - lock_time)} 秒")
+                return False, '账户被锁定，请 5 分钟后重试'
+        
+        admin = Admin.query.filter_by(username=username).first()
+        if admin and check_password_hash(admin.password, password):
+            if username in login_attempts:
+                del login_attempts[username]
+            logging.info(f"管理员登录成功: 用户名={username}")
+            return True, None
+        else:
+            if username in login_attempts:
+                login_attempts[username][0] += 1
+                if login_attempts[username][0] >= 3:
+                    login_attempts[username][1] = time()
+            else:
+                login_attempts[username] = [1, time()]
+            logging.warning(f"管理员登录失败: 用户名={username}, 尝试次数={login_attempts.get(username, [0])[0]}")
+            return False, '用户名或密码错误'
+    except Exception as e:
+        logging.error(f"验证管理员凭据时出错: {e}")
+        return False, f'服务器错误: {e}'
+
+def ensure_admin_session():
+    if 'admin' not in session:
+        logging.warning("会话中缺少管理员身份，重定向到登录页面")
+        return redirect(url_for('login'))
+    return None
+
+# 错误处理
+@app.errorhandler(500)
+def internal_error(error):
+    logging.error(f"服务器内部错误: {error}")
+    return render_template('error.html', error='服务器内部错误，请稍后重试'), 500
+
+@app.errorhandler(400)
+def bad_request(error):
+    logging.error(f"无效请求错误: {error}")
+    return render_template('error.html', error='请求无效，可能缺少 CSRF 令牌'), 400
+
+@app.errorhandler(404)
+def not_found(error):
+    logging.error(f"页面未找到: {error}")
+    return render_template('error.html', error='页面未找到，请检查 URL'), 404
+
+# 路由
+@app.route('/admin', methods=['GET'], strict_slashes=False)
+def admin():
+    if redirect_response := ensure_admin_session():
+        return redirect_response
+    logging.info(f"管理员仪表板访问者: {session['admin']}")
+    return render_template('admin.html')
+
+@app.route('/admin/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        username = form.username.data
+        password = form.password.data
+        if not is_valid_username(username):
+            logging.warning(f"用户名格式无效: {username}")
+            return render_template('login.html', form=form, error='用户名格式无效')
+        success, error = check_admin_credentials(username, password)
+        if success:
+            session['admin'] = username
+            session.permanent = True
+            logging.info(f"会话设置管理员: {username}")
+            return redirect(url_for('admin'))
+        return render_template('login.html', form=form, error=error)
+    return render_template('login.html', form=form)
+
+@app.route('/admin/change_password', methods=['GET', 'POST'])
+def change_password():
+    if redirect_response := ensure_admin_session():
+        return redirect_response
+    form = ChangePasswordForm()
+    if form.validate_on_submit():
+        username = session['admin']
+        current_password = form.current_password.data
+        new_password = form.new_password.data
+        try:
+            admin = Admin.query.filter_by(username=username).first()
+            if not admin:
+                flash('管理员账户不存在', 'danger')
+                logging.warning(f"修改密码失败: 用户名={username}, 账户不存在")
+            elif not check_password_hash(admin.password, current_password):
+                flash('当前密码错误', 'danger')
+                logging.warning(f"修改密码失败: 用户名={username}, 当前密码错误")
+            else:
+                admin.password = generate_password_hash(new_password)
+                db.session.commit()
+                flash('密码修改成功，请重新登录', 'success')
+                logging.info(f"管理员密码修改成功: 用户名={username}")
+                session.pop('admin', None)
+                return redirect(url_for('login'))
+        except Exception as e:
+            flash('服务器错误，请稍后重试', 'danger')
+            logging.error(f"修改密码错误: {e}")
+    else:
+        for field, errors in form.errors.items():
+            for error in errors:
+                flash(error, 'danger')
+                logging.warning(f"密码表单验证失败: 字段={field}, 错误={error}")
+    return render_template('change_password.html', form=form)
+
+@app.route('/admin/cards', methods=['GET'])
+def cards():
+    if redirect_response := ensure_admin_session():
+        return redirect_response
+    try:
+        cards = Card.query.all()
+        card_list = [
+            {
+                'index': i,
+                'card_key': card.card_key,
+                'username': card.username,
+                'created_at': card.created_at.strftime('%Y-%m-%d %H:%M:%S') if card.created_at else '未知',
+                'first_used_at': card.first_used_at.strftime('%Y-%m-%d %H:%M:%S') if card.first_used_at else '未启用',
+                'expiry_date': (card.first_used_at + timedelta(hours=card.duration_hours)).strftime('%Y-%m-%d %H:%M:%S') if card.first_used_at else '未启用',
+                'query_count': card.query_count or 0,
+                'max_query_count': card.max_query_count or 10
+            }
+            for i, card in enumerate(cards, 1)
+        ]
+        return render_template('cards.html', cards=card_list)
+    except Exception as e:
+        logging.error(f"卡号列表错误: {e}")
+        return render_template('cards.html', error=f'服务器错误: {e}')
+
+@app.route('/admin/delete_card/<card_key>', methods=['POST'])
+def delete_card(card_key):
+    if redirect_response := ensure_admin_session():
+        return redirect_response
+    try:
+        card = Card.query.get(card_key)
+        if card:
+            db.session.delete(card)
+            db.session.commit()
+            logging.info(f"卡号已删除: {card_key}")
+            return redirect(url_for('cards', success=f'卡密 {card_key} 删除成功'))
+        return redirect(url_for('cards', error='卡密不存在'))
+    except Exception as e:
+        logging.error(f"删除卡号错误: {e}")
+        return redirect(url_for('cards', error=f'服务器错误: {e}'))
+
+@app.route('/admin/batch_generate', methods=['GET', 'POST'])
+def batch_generate():
+    if redirect_response := ensure_admin_session():
+        return redirect_response
+    form = BatchGenerateForm()
+    form.username.choices = [(account.username, account.username) for account in Account.query.all()]
+    error = success = None
+    if form.validate_on_submit():
+        username = form.username.data
+        count = form.count.data
+        max_query_count = form.max_query_count.data
+        duration_hours = int(form.duration_hours.data)
+        if not is_valid_username(username):
+            error = '用户名格式无效'
+        else:
+            try:
+                account = Account.query.get(username)
+                if not account:
+                    error = '账号不存在'
+                else:
+                    card_keys = []
+                    for _ in range(count):
+                        card_key = generate_random_string(16, chars=string.digits + string.ascii_lowercase)
+                        card = Card(
+                            card_key=card_key,
+                            username=username,
+                            created_at=datetime.utcnow(),
+                            max_query_count=max_query_count,
+                            duration_hours=duration_hours
+                        )
+                        db.session.add(card)
+                        card_keys.append(card_key)
+                    db.session.commit()
+                    success = f'成功为账号 {username} 生成 {count} 个卡密（最大查询次数 {max_query_count}，时长 {duration_hours}小时）：{",".join(card_keys)}'
+                    logging.info(f"生成 {count} 个卡密给 {username}，最大查询次数 {max_query_count}，时长 {duration_hours}小时")
+            except Exception as e:
+                error = f'服务器错误: {e}'
+                logging.error(f"批量生成卡密错误: {e}")
+    return render_template('batch_generate.html', form=form, error=error, success=success)
+
+@app.route('/admin/accounts', methods=['GET', 'POST'])
+def accounts():
+    if redirect_response := ensure_admin_session():
+        return redirect_response
+    form = AccountForm()
+    error = success = None
+    logging.debug(f"请求方法: {request.method}")
+    
+    if request.method == 'POST':
+        logging.debug(f"表单数据: {request.form.to_dict()}")
+        if form.validate_on_submit():
+            action = form.action.data
+            username = form.username.data
+            logging.info(f"接收到表单提交: action={action}, username={username}")
+            if not is_valid_username(username):
+                error = '用户名格式无效'
+                logging.warning(f"用户名格式无效: {username}")
+            elif action == 'add':
+                password = form.password.data
+                logging.info(f"添加账号: username={username}, 密码长度={len(password) if password else 0}")
+                if not password:
+                    error = '请输入密码'
+                    logging.warning(f"添加账号失败: 未输入密码")
+                elif Account.query.get(username):
+                    error = '账号已存在'
+                    logging.warning(f"添加账号失败: 账号已存在 {username}")
+                else:
+                    try:
+                        account = Account(
+                            username=username,
+                            password=password,
+                            created_at=datetime.utcnow()
+                        )
+                        db.session.add(account)
+                        db.session.commit()
+                        success = f'账号 {username} 添加成功'
+                        logging.info(f"账号添加成功: {username}")
+                    except Exception as e:
+                        error = f'数据库错误: {str(e)}'
+                        logging.error(f"数据库错误: {str(e)}")
+                        db.session.rollback()
+            elif action == 'modify_random':
+                account = Account.query.get(username)
+                if account:
+                    new_password = generate_random_string(8, exclude_chars='0oO1iIlLq9g')
+                    account.password = new_password
+                    db.session.commit()
+                    success = f'账号 {username} 密码修改为: {new_password}'
+                    logging.info(f"密码修改成功: {username}")
+                else:
+                    error = '账号不存在'
+    
+    try:
+        accounts = db.session.query(Account, db.func.count(Card.card_key).label('card_count'))\
+            .outerjoin(Card, Account.username == Card.username)\
+            .group_by(Account.username).all()
+        logging.debug(f"账号查询结果: {[(a.username, c) for a, c in accounts]}")
+        account_list = [
+            {
+                'index': i,
+                'username': account.username,
+                'password': account.password,
+                'created_at': account.created_at.strftime('%Y-%m-%d %H:%M:%S') if account.created_at else '未知',
+                'card_count': card_count
+            }
+            for i, (account, card_count) in enumerate(accounts, 1)
+        ]
+        return render_template('accounts.html', accounts=account_list, form=form, error=error, success=success)
+    except Exception as e:
+        logging.error(f"账号管理错误: {e}")
+        return render_template('accounts.html', form=form, error=f'服务器错误: {e}')
+
+@app.route('/admin/delete_account/<username>', methods=['POST'])
+def delete_account(username):
+    if redirect_response := ensure_admin_session():
+        return redirect_response
+    try:
+        account = Account.query.get(username)
+        if account:
+            Card.query.filter_by(username=username).delete()
+            db.session.delete(account)
+            db.session.commit()
+            logging.info(f"账号已删除: {username}")
+            return redirect(url_for('accounts', success=f'账号 {username} 删除成功'))
+        return redirect(url_for('accounts', error='账号不存在'))
+    except Exception as e:
+        logging.error(f"删除账号错误: {e}")
+        return redirect(url_for('accounts', error=f'服务器错误: {e}'))
+
+@app.route('/query', methods=['GET'])
+def query():
+    card_key = request.args.get('card_key')
+    if not card_key:
+        return render_template('query.html', error='请提供卡密')
+    try:
+        card = Card.query.get(card_key)
+        if not card:
+            return render_template('query.html', error='卡密不存在')
+        
+        now = datetime.utcnow()
+        if card.query_count >= card.max_query_count:
+            return render_template('query.html', error='卡密查询次数已达上限')
+        
+        if not card.first_used_at:
+            card.first_used_at = now
+            card.query_count += 1
+            db.session.commit()
+        else:
+            card.query_count += 1
+            db.session.commit()
+
+        expiry_date = card.first_used_at + timedelta(hours=card.duration_hours)
+        if now > expiry_date:
+            return render_template('query.html', error='卡密已过期')
+
+        account = Account.query.get(card.username)
+        if account:
+            return render_template(
+                'query.html',
+                username=account.username,
+                password=account.password,
+                expiry_date=expiry_date.strftime('%Y-%m-%d %H:%M:%S'),
+                query_count=card.query_count,
+                max_query_count=card.max_query_count
+            )
+        return render_template('query.html', error='绑定的账号不存在')
+    except Exception as e:
+        logging.error(f"卡密查询错误: {e}")
+        return render_template('query.html', error=f'服务器错误: {e}')
+
+@app.route('/admin/query', methods=['GET'])
+def admin_query():
+    if redirect_response := ensure_admin_session():
+        return redirect_response
+    card_key = request.args.get('card_key')
+    if not card_key:
+        return render_template('query.html', error='请提供卡密')
+    try:
+        card = Card.query.get(card_key)
+        if not card:
+            return render_template('query.html', error='卡密不存在')
+        
+        now = datetime.utcnow()
+        if card.query_count >= card.max_query_count:
+            return render_template('query.html', error='卡密查询次数已达上限')
+        
+        if not card.first_used_at:
+            card.first_used_at = now
+            card.query_count += 1
+            db.session.commit()
+        else:
+            card.query_count += 1
+            db.session.commit()
+
+        expiry_date = card.first_used_at + timedelta(hours=card.duration_hours)
+        if now > expiry_date:
+            return render_template('query.html', error='卡密已过期')
+
+        account = Account.query.get(card.username)
+        if account:
+            return render_template(
+                'query.html',
+                username=account.username,
+                password=account.password,
+                expiry_date=expiry_date.strftime('%Y-%m-%d %H:%M:%S'),
+                query_count=card.query_count,
+                max_query_count=card.max_query_count
+            )
+        return render_template('query.html', error='绑定的账号不存在')
+    except Exception as e:
+        logging.error(f"管理员卡密查询错误: {e}")
+        return render_template('query.html', error=f'服务器错误: {e}')
+
+@app.route('/api/query', methods=['GET'])
+def api_query():
+    card_key = request.args.get('card_key')
+    if not card_key:
+        return jsonify({"error": "请提供卡密"}), 400
+    try:
+        card = Card.query.get(card_key)
+        if not card:
+            return jsonify({"error": "卡密不存在"}), 404
+        
+        now = datetime.utcnow()
+        if card.query_count >= card.max_query_count:
+            return jsonify({"error": "卡密查询次数已达上限"}), 400
+        
+        if not card.first_used_at:
+            card.first_used_at = now
+            card.query_count += 1
+            db.session.commit()
+        else:
+            card.query_count += 1
+            db.session.commit()
+
+        expiry_date = card.first_used_at + timedelta(hours=card.duration_hours)
+        if now > expiry_date:
+            return jsonify({"error": "卡密已过期"}), 400
+
+        account = Account.query.get(card.username)
+        if account:
+            return jsonify({
+                "username": account.username,
+                "password": account.password,
+                "expiry_date": expiry_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "query_count": card.query_count,
+                "max_query_count": card.max_query_count
+            })
+        return jsonify({"error": "绑定的账号不存在"}), 404
+    except Exception as e:
+        logging.error(f"API 查询错误: {e}")
+        return jsonify({"error": f"服务器错误: {e}"}), 500
+
+def init_db():
+    try:
+        logging.debug("开始数据库初始化")
+        logging.debug(f"数据库路径: {DATABASE_PATH}")
+        
+        if not os.path.exists(INSTANCE_DIR):
+            os.makedirs(INSTANCE_DIR, exist_ok=True)
+            logging.info(f"创建 instance 目录: {INSTANCE_DIR}")
+        
+        try:
+            test_file = os.path.join(INSTANCE_DIR, 'test_write.txt')
+            with open(test_file, 'w') as f:
+                f.write('test')
+            os.remove(test_file)
+            logging.debug(f"instance 目录可写: {INSTANCE_DIR}")
+        except PermissionError as e:
+            logging.error(f"instance 目录权限拒绝: {e}")
+            raise Exception(f"无法写入 instance 目录: {INSTANCE_DIR}. 请检查权限。")
+        
+        if os.path.exists(DATABASE_PATH):
+            try:
+                with open(DATABASE_PATH, 'a'):
+                    pass
+                logging.debug(f"数据库文件可写: {DATABASE_PATH}")
+            except PermissionError as e:
+                logging.error(f"数据库文件权限拒绝: {e}")
+                raise Exception(f"无法写入数据库文件: {DATABASE_PATH}. 请检查权限。")
+        
+        db.create_all()
+        logging.debug("数据库表已创建")
+        
+        inspector = db.inspect(db.engine)
+        tables = inspector.get_table_names()
+        logging.debug(f"数据库表: {tables}")
+        
+        if not Admin.query.filter_by(username='admin').first():
+            admin = Admin(username='admin', password=generate_password_hash('admin123'))
+            db.session.add(admin)
+            db.session.commit()
+            logging.info("管理员账户已创建: 用户名=admin")
+        
+        admin_check = Admin.query.filter_by(username='admin').first()
+        if admin_check:
+            logging.info("数据库中管理员账户已验证")
+        else:
+            logging.error("无法验证数据库中的管理员账户")
+            
+        logging.info("数据库初始化成功")
+    except Exception as e:
+        logging.error(f"数据库初始化错误: {e}")
+        logging.exception("详细错误信息:")
+        raise
+
+# 初始化数据库
+logging.debug("开始 Flask 应用初始化")
+with app.app_context():
+    init_db()
+logging.debug("Flask 应用初始化完成")
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000, debug=False)
